@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <unordered_set>
+#include <algorithm>
 #include "ASTree.h"
 #include "FastStack.h"
 #include "pyc_numeric.h"
@@ -101,9 +102,48 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
     
     // Load exception table for Python 3.11+
     std::vector<PycExceptionTableEntry> exceptionTable;
+    std::vector<PycExceptionTableEntry> userExcEntries;
+    std::vector<bool> userExcTryOpened;
+    std::vector<bool> userExcHandlerOpened;
     if (mod->verCompare(3, 11) >= 0 && code->exceptTable() != NULL) {
         exceptionTable = code->exceptionTableEntries();
+        for (const auto& e : exceptionTable) {
+            if (e.stack_depth == 0) {
+                userExcEntries.push_back(e);
+            }
+        }
+        // Sort by start offset so we can scan in order
+        std::sort(userExcEntries.begin(), userExcEntries.end(),
+                  [](const PycExceptionTableEntry& a, const PycExceptionTableEntry& b) {
+                      if (a.start_offset != b.start_offset)
+                          return a.start_offset < b.start_offset;
+                      return a.end_offset < b.end_offset;
+                  });
+        userExcTryOpened.assign(userExcEntries.size(), false);
+        userExcHandlerOpened.assign(userExcEntries.size(), false);
     }
+    int activeExcEntry = -1;
+    enum ExcHandlerHeadState {
+        EHH_NONE,               
+        EHH_EXPECT_PUSH_INFO,   
+        EHH_EXPECT_TYPE,        
+        EHH_EXPECT_CHECK,       
+        EHH_EXPECT_JUMP,        
+        EHH_EXPECT_BIND         
+    };
+    ExcHandlerHeadState ehhState = EHH_NONE;
+    PycRef<ASTNode> pendingExcType;
+    PycRef<ASTNode> pendingExcAsName; 
+    enum ExcCleanupState {
+        EC_NONE,
+        EC_AFTER_POP_EXCEPT,    
+        EC_EXPECT_STORE_NONE,   
+        EC_EXPECT_DELETE        
+    };
+    ExcCleanupState ecState = EC_NONE;
+    PycRef<ASTNode> currentHandlerAsName;
+    PycRef<ASTNode> lastHandlerAsName;
+    int postExcState = 0; 
 
     while (!source.atEof()) {
 #if defined(BLOCK_DEBUG) || defined(STACK_DEBUG)
@@ -121,10 +161,281 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
 
         curpos = pos;
         bc_next(source, mod, opcode, operand, pos);
-        
-        // Check if we're at the start of an exception handler region (Python 3.11+)
-        // TODO: This needs proper implementation for Python 3.11 exception tables
-        // For now, disabled to avoid creating malformed try-except blocks
+        if (!userExcEntries.empty()) {
+            if (activeExcEntry < 0) {
+                for (int i = 0; i < (int)userExcEntries.size(); ++i) {
+                    if (userExcTryOpened[i])
+                        continue;
+                    if (userExcEntries[i].start_offset == curpos) {
+                        activeExcEntry = i;
+                        userExcTryOpened[i] = true;
+
+                        PycRef<ASTBlock> container =
+                            new ASTContainerBlock(0, userExcEntries[i].target);
+                        container->init();
+                        blocks.push(container);
+                        stack_hist.push(stack);
+
+                        PycRef<ASTBlock> tryblock =
+                            new ASTBlock(ASTBlock::BLK_TRY,
+                                         userExcEntries[i].target, true);
+                        blocks.push(tryblock);
+                        curblock = tryblock;
+                        break;
+                    }
+                }
+            }
+            if (activeExcEntry >= 0 &&
+                !userExcHandlerOpened[activeExcEntry] &&
+                curpos == userExcEntries[activeExcEntry].target) {
+                userExcHandlerOpened[activeExcEntry] = true;
+                std::stack<PycRef<ASTBlock>> tmpStack;
+                while (!blocks.empty() &&
+                       blocks.top()->blktype() != ASTBlock::BLK_TRY) {
+                    tmpStack.push(blocks.top());
+                    blocks.pop();
+                }
+                if (!blocks.empty() &&
+                    blocks.top()->blktype() == ASTBlock::BLK_TRY) {
+                    PycRef<ASTBlock> tryblock = blocks.top();
+                    blocks.pop();
+                    if (!blocks.empty() &&
+                        blocks.top()->blktype() == ASTBlock::BLK_CONTAINER) {
+                        blocks.top()->append(tryblock.cast<ASTNode>());
+                    }
+                }
+                while (!tmpStack.empty()) {
+                    blocks.push(tmpStack.top());
+                    tmpStack.pop();
+                }
+                if (!stack_hist.empty()) {
+                    stack = stack_hist.top();
+                    stack_hist.pop();
+                }
+                int safeExcEnd = code->code() != NULL
+                    ? code->code()->length()
+                    : 0x7fffffff;
+                PycRef<ASTCondBlock> exceptblk =
+                    new ASTCondBlock(ASTBlock::BLK_EXCEPT,
+                                     safeExcEnd, NULL, false);
+                blocks.push(exceptblk.cast<ASTBlock>());
+                curblock = exceptblk.cast<ASTBlock>();
+
+                ehhState = EHH_EXPECT_PUSH_INFO;
+                pendingExcType = NULL;
+                pendingExcAsName = NULL;
+                currentHandlerAsName = NULL;
+                ecState = EC_NONE;
+            }
+        }
+        if (mod->verCompare(3, 11) >= 0 && activeExcEntry == -1 &&
+            !userExcEntries.empty()) {
+            bool insideExcept = false;
+            {
+                std::stack<PycRef<ASTBlock>> tmp = blocks;
+                while (!tmp.empty()) {
+                    if (tmp.top()->blktype() == ASTBlock::BLK_EXCEPT) {
+                        insideExcept = true;
+                        break;
+                    }
+                    tmp.pop();
+                }
+            }
+            if (!insideExcept) {
+                bool swallow = false;
+                switch (opcode) {
+                case Pyc::RERAISE:
+                case Pyc::RERAISE_A:
+                case Pyc::POP_EXCEPT:
+                case Pyc::PUSH_EXC_INFO:
+                case Pyc::COPY_A:
+                    swallow = true;
+                    break;
+                default:
+                    break;
+                }
+                if (swallow) {
+                    postExcState = 0;
+                    continue;
+                }
+                if (lastHandlerAsName != NULL) {
+                    PycRef<ASTName> lastName =
+                        lastHandlerAsName.try_cast<ASTName>();
+                    if (lastName != NULL) {
+                        const char* wanted = lastName->name()->value();
+                        switch (postExcState) {
+                        case 0:
+                            if (opcode == Pyc::LOAD_CONST_A) {
+                                PycRef<PycObject> c = code->getConst(operand);
+                                if (c == Pyc_None) {
+                                    postExcState = 1;
+                                    continue;
+                                }
+                            }
+                            lastHandlerAsName = NULL;
+                            postExcState = 0;
+                            break;
+                        case 1:
+                            if (opcode == Pyc::STORE_FAST_A) {
+                                PycRef<PycString> lname = code->getLocal(operand);
+                                if (lname->value() == wanted) {
+                                    postExcState = 2;
+                                    continue;
+                                }
+                            }
+                            lastHandlerAsName = NULL;
+                            postExcState = 0;
+                            break;
+                        case 2:
+                            if (opcode == Pyc::DELETE_FAST_A) {
+                                PycRef<PycString> lname = code->getLocal(operand);
+                                if (lname->value() == wanted) {
+                                    postExcState = 0;
+                                    continue;
+                                }
+                            }
+                            lastHandlerAsName = NULL;
+                            postExcState = 0;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (ehhState != EHH_NONE) {
+            bool consumed = false;
+            switch (ehhState) {
+            case EHH_EXPECT_PUSH_INFO:
+                if (opcode == Pyc::PUSH_EXC_INFO) {
+                    ehhState = EHH_EXPECT_TYPE;
+                    consumed = true;
+                }
+                break;
+            case EHH_EXPECT_TYPE:
+                if (opcode == Pyc::LOAD_GLOBAL_A) {
+                    int nameIdx = operand;
+                    if (mod->verCompare(3, 11) >= 0)
+                        nameIdx >>= 1;
+                    pendingExcType = new ASTName(code->getName(nameIdx));
+                    ehhState = EHH_EXPECT_CHECK;
+                    consumed = true;
+                } else if (opcode == Pyc::LOAD_NAME_A) {
+                    pendingExcType = new ASTName(code->getName(operand));
+                    ehhState = EHH_EXPECT_CHECK;
+                    consumed = true;
+                } else if (opcode == Pyc::LOAD_FAST_A) {
+                    pendingExcType = new ASTName(code->getLocal(operand));
+                    ehhState = EHH_EXPECT_CHECK;
+                    consumed = true;
+                } else if (opcode == Pyc::LOAD_CONST_A) {
+                    pendingExcType = new ASTObject(code->getConst(operand));
+                    ehhState = EHH_EXPECT_CHECK;
+                    consumed = true;
+                }
+                break;
+            case EHH_EXPECT_CHECK:
+                if (opcode == Pyc::CHECK_EXC_MATCH) {
+                    ehhState = EHH_EXPECT_JUMP;
+                    consumed = true;
+                }
+                break;
+            case EHH_EXPECT_JUMP:
+                if (opcode == Pyc::POP_JUMP_FORWARD_IF_FALSE_A ||
+                    opcode == Pyc::POP_JUMP_IF_FALSE_A ||
+                    opcode == Pyc::POP_JUMP_BACKWARD_IF_FALSE_A) {
+                    ehhState = EHH_EXPECT_BIND;
+                    consumed = true;
+                }
+                break;
+            case EHH_EXPECT_BIND:
+                if (opcode == Pyc::STORE_FAST_A) {
+                    pendingExcAsName = new ASTName(code->getLocal(operand));
+                    currentHandlerAsName = pendingExcAsName;
+                    consumed = true;
+                } else if (opcode == Pyc::POP_TOP) {
+                    pendingExcAsName = NULL;
+                    currentHandlerAsName = NULL;
+                    consumed = true;
+                }
+                if (consumed) {
+                    if (!blocks.empty() &&
+                        blocks.top()->blktype() == ASTBlock::BLK_EXCEPT) {
+                        PycRef<ASTCondBlock> cb = blocks.top().cast<ASTCondBlock>();
+                        PycRef<ASTNode> cond;
+                        if (pendingExcType != NULL) {
+                            if (pendingExcAsName != NULL) {
+                                cond = new ASTStore(pendingExcType, pendingExcAsName);
+                            } else {
+                                cond = pendingExcType;
+                            }
+                        }
+                        PycRef<ASTBlock> replacement =
+                            new ASTCondBlock(ASTBlock::BLK_EXCEPT,
+                                             cb->end(), cond, false);
+                        replacement->init();
+                        for (const auto& n : cb->nodes()) {
+                            replacement->append(n);
+                        }
+                        blocks.pop();
+                        blocks.push(replacement);
+                        curblock = replacement;
+                    }
+                    ehhState = EHH_NONE;
+                }
+                break;
+            default:
+                break;
+            }
+            if (consumed) {
+                continue;
+            }
+        }
+
+        if (ecState != EC_NONE && currentHandlerAsName != NULL) {
+            bool consumed = false;
+            switch (ecState) {
+            case EC_AFTER_POP_EXCEPT:
+                if (opcode == Pyc::LOAD_CONST_A) {
+                    PycRef<PycObject> c = code->getConst(operand);
+                    if (c == Pyc_None) {
+                        ecState = EC_EXPECT_STORE_NONE;
+                        consumed = true;
+                    }
+                }
+                if (!consumed)
+                    ecState = EC_NONE;
+                break;
+            case EC_EXPECT_STORE_NONE:
+                if (opcode == Pyc::STORE_FAST_A) {
+                    PycRef<PycString> lname = code->getLocal(operand);
+                    PycRef<ASTName> asName = currentHandlerAsName.try_cast<ASTName>();
+                    if (asName != NULL &&
+                        lname->value() == asName->name()->value()) {
+                        ecState = EC_EXPECT_DELETE;
+                        consumed = true;
+                    }
+                }
+                if (!consumed)
+                    ecState = EC_NONE;
+                break;
+            case EC_EXPECT_DELETE:
+                if (opcode == Pyc::DELETE_FAST_A) {
+                    PycRef<PycString> lname = code->getLocal(operand);
+                    PycRef<ASTName> asName = currentHandlerAsName.try_cast<ASTName>();
+                    if (asName != NULL &&
+                        lname->value() == asName->name()->value()) {
+                        consumed = true;
+                    }
+                }
+                ecState = EC_NONE;
+                break;
+            default:
+                ecState = EC_NONE;
+                break;
+            }
+            if (consumed)
+                continue;
+        }
 
         if (need_try && opcode != Pyc::SETUP_EXCEPT_A) {
             need_try = false;
@@ -167,6 +478,8 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                     if (!stack_hist.empty())
                         stack_hist.pop();
                 }
+                if (blocks.empty())
+                    break;
                 blocks.pop();
 
                 if (blocks.empty())
@@ -1345,16 +1658,28 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                             }
                         }
                     } else if (curblock->blktype() == ASTBlock::BLK_ELSE) {
+                        if (stack_hist.empty() || blocks.empty()) {
+                            fprintf(stderr, "Warning: Block stack or stack history empty in BLK_ELSE pop path\n");
+                            break;
+                        }
                         stack = stack_hist.top();
                         stack_hist.pop();
 
                         blocks.pop();
+                        if (blocks.empty()) {
+                            fprintf(stderr, "Warning: Block stack emptied after BLK_ELSE pop\n");
+                            break;
+                        }
                         blocks.top()->append(curblock.cast<ASTNode>());
                         curblock = blocks.top();
 
                         if (curblock->blktype() == ASTBlock::BLK_CONTAINER
                                 && !curblock.cast<ASTContainerBlock>()->hasFinally()) {
                             blocks.pop();
+                            if (blocks.empty()) {
+                                fprintf(stderr, "Warning: Block stack emptied after BLK_CONTAINER pop\n");
+                                break;
+                            }
                             blocks.top()->append(curblock.cast<ASTNode>());
                             curblock = blocks.top();
                         }
@@ -1531,7 +1856,7 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                         }
                         push = false;
 
-                        if (prev->blktype() == ASTBlock::BLK_MAIN) {
+                        if (prev != nil && prev->blktype() == ASTBlock::BLK_MAIN) {
                             /* Something went out of control! */
                             prev = nil;
                         }
@@ -1983,6 +2308,10 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
             if (mod->verCompare(3, 11) >= 0 && !stack.empty()) {
                 stack.pop();
             }
+
+            if (currentHandlerAsName != NULL) {
+                ecState = EC_AFTER_POP_EXCEPT;
+            }
             break;
         case Pyc::END_FOR:
             {
@@ -2130,6 +2459,34 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                         curblock = prev;
                     }
                 }
+
+                if (curblock->blktype() == ASTBlock::BLK_EXCEPT &&
+                    activeExcEntry >= 0 &&
+                    mod->verCompare(3, 11) >= 0) {
+                    PycRef<ASTBlock> exceptBlk = curblock;
+                    blocks.pop();
+                    if (!blocks.empty() &&
+                        blocks.top()->blktype() == ASTBlock::BLK_CONTAINER) {
+                        blocks.top()->append(exceptBlk.cast<ASTNode>());
+                        PycRef<ASTBlock> container = blocks.top();
+                        blocks.pop();
+                        if (!blocks.empty()) {
+                            blocks.top()->append(container.cast<ASTNode>());
+                            curblock = blocks.top();
+                        } else {
+                            blocks.push(container);
+                            curblock = container;
+                        }
+                    } else if (!blocks.empty()) {
+                        curblock = blocks.top();
+                    }
+
+                    lastHandlerAsName = currentHandlerAsName;
+                    postExcState = 0;
+                    currentHandlerAsName = NULL;
+                    ecState = EC_NONE;
+                    activeExcEntry = -1;
+                }
             }
             break;
         case Pyc::RETURN_VALUE:
@@ -2160,15 +2517,41 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
 
                     bc_next(source, mod, opcode, operand, pos);
                 }
+
+
+                if (curblock != nullptr &&
+                    curblock->blktype() == ASTBlock::BLK_EXCEPT &&
+                    activeExcEntry >= 0 &&
+                    mod->verCompare(3, 11) >= 0 &&
+                    !blocks.empty() && blocks.top() == curblock) {
+                    PycRef<ASTBlock> exceptBlk = curblock;
+                    blocks.pop();
+                    if (!blocks.empty() &&
+                        blocks.top()->blktype() == ASTBlock::BLK_CONTAINER) {
+                        blocks.top()->append(exceptBlk.cast<ASTNode>());
+                        PycRef<ASTBlock> container = blocks.top();
+                        blocks.pop();
+                        if (!blocks.empty()) {
+                            blocks.top()->append(container.cast<ASTNode>());
+                            curblock = blocks.top();
+                        } else {
+                            blocks.push(container);
+                            curblock = container;
+                        }
+                    } else if (!blocks.empty()) {
+                        curblock = blocks.top();
+                    }
+
+                    lastHandlerAsName = currentHandlerAsName;
+                    postExcState = 0;
+                    currentHandlerAsName = NULL;
+                    ecState = EC_NONE;
+                    activeExcEntry = -1;
+                }
             }
             break;
         case Pyc::RETURN_GENERATOR:
             {
-                // RETURN_GENERATOR: Create a generator object and return it
-                // This is used at the start of generator functions
-                // For decompilation purposes, we don't need to do anything special
-                // The function is already marked as a generator by its code flags
-                // Just return None (implicit in generators)
                 curblock->append(new ASTReturn(NULL));
             }
             break;
@@ -3087,22 +3470,41 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
             break;
         case Pyc::RERAISE:
             {
-                // RERAISE re-raises the exception on top of the stack (Python 3.9)
-                // No parameters, just issue a bare raise
-                curblock->append(new ASTRaise(ASTRaise::param_t()));
+                bool inExcept = false;
+                {
+                    std::stack<PycRef<ASTBlock>> tmp = blocks;
+                    while (!tmp.empty()) {
+                        if (tmp.top()->blktype() == ASTBlock::BLK_EXCEPT) {
+                            inExcept = true;
+                            break;
+                        }
+                        tmp.pop();
+                    }
+                }
+                if (inExcept) {
+                    curblock->append(new ASTRaise(ASTRaise::param_t()));
+                }
             }
             break;
         case Pyc::RERAISE_A:
             {
-                // RERAISE with argument (Python 3.10+)
-                // If operand is non-zero, pop an additional value from the stack
-                // which is used to set f_lasti of the current frame
                 if (operand && !stack.empty()) {
-                    // Pop the f_lasti value (we don't need it for decompilation)
                     stack.pop();
                 }
-                // Issue a bare raise
-                curblock->append(new ASTRaise(ASTRaise::param_t()));
+                bool inExcept = false;
+                {
+                    std::stack<PycRef<ASTBlock>> tmp = blocks;
+                    while (!tmp.empty()) {
+                        if (tmp.top()->blktype() == ASTBlock::BLK_EXCEPT) {
+                            inExcept = true;
+                            break;
+                        }
+                        tmp.pop();
+                    }
+                }
+                if (inExcept) {
+                    curblock->append(new ASTRaise(ASTRaise::param_t()));
+                }
             }
             break;
         default:
@@ -3605,7 +4007,15 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
             } else if (blk->blktype() == ASTBlock::BLK_EXCEPT &&
                     blk.cast<ASTCondBlock>()->cond() != NULL) {
                 pyc_output << " ";
-                print_src(blk.cast<ASTCondBlock>()->cond(), mod, pyc_output);
+                PycRef<ASTNode> cond = blk.cast<ASTCondBlock>()->cond();
+                if (cond.type() == ASTNode::NODE_STORE) {
+                    PycRef<ASTStore> st = cond.cast<ASTStore>();
+                    print_src(st->src(), mod, pyc_output);
+                    pyc_output << " as ";
+                    print_src(st->dest(), mod, pyc_output);
+                } else {
+                    print_src(cond, mod, pyc_output);
+                }
             } else if (blk->blktype() == ASTBlock::BLK_WITH) {
                 pyc_output << " ";
                 print_src(blk.cast<ASTWithBlock>()->expr(), mod, pyc_output);
